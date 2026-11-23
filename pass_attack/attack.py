@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import RandomResizedCrop
 
@@ -21,6 +22,12 @@ ADAPTIVE_SCHEDULES = {
 CHECKPOINTS = RECORD_CHECKPOINTS + ADAPTIVE_SCHEDULES["c2"]
 CHECKPOINT_SCHEDULES = tuple(ADAPTIVE_SCHEDULES)
 
+APGD_INITIAL_WINDOW_RATIO = 0.22
+APGD_MINIMUM_WINDOW_RATIO = 0.06
+APGD_WINDOW_DECREMENT_RATIO = 0.03
+APGD_RHO = 0.75
+APGD_STEP_DECAY = 0.5
+
 MOMENTUM_FACTOR = 1.0
 INPUT_DIVERSITY_PROBABILITY = 0.7
 TRANSLATION_KERNEL_SIZE = 5
@@ -37,6 +44,7 @@ class AttackSpec:
     use_nesterov: bool
     use_su: bool
     use_pass: bool
+    use_apgd: bool = False
 
 
 ATTACK_SPECS = {
@@ -48,8 +56,9 @@ ATTACK_SPECS = {
     "dtni-pass": AttackSpec("DTNI-PASS", True, True, False, True),
     "dtni-su": AttackSpec("DTNI-SU", True, True, True, False),
     "dtni-su-pass": AttackSpec("DTNI-SU-PASS", True, True, True, True),
+    "dtni-su-apgd": AttackSpec("DTNI-SU-APGD", True, True, True, False, True),
 }
-ATTACK_NAMES = tuple(ATTACK_SPECS)
+ATTACK_NAMES = tuple(ATTACK_SPECS) + ("apgd",)
 
 
 def resolve_checkpoints(schedule="c2", steps=STEPS):
@@ -64,6 +73,28 @@ def resolve_checkpoints(schedule="c2", steps=STEPS):
     return record, adaptive
 
 
+def apgd_checkpoints(
+    steps=STEPS,
+    initial_ratio=APGD_INITIAL_WINDOW_RATIO,
+    minimum_ratio=APGD_MINIMUM_WINDOW_RATIO,
+    decrement_ratio=APGD_WINDOW_DECREMENT_RATIO,
+):
+    steps = int(steps)
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    initial = max(int(float(initial_ratio) * steps), 1)
+    minimum = max(int(float(minimum_ratio) * steps), 1)
+    decrement = max(int(float(decrement_ratio) * steps), 1)
+    checkpoints = {}
+    interval = initial
+    position = interval
+    while position <= steps:
+        checkpoints[position] = interval
+        interval = max(interval - decrement, minimum)
+        position += interval
+    return checkpoints
+
+
 def classification_loss(logits, labels, loss_name, targeted):
     if loss_name == "ce":
         loss = F.cross_entropy(logits, labels, reduction="none")
@@ -72,6 +103,19 @@ def classification_loss(logits, labels, loss_name, targeted):
         selected = logits.gather(1, labels.unsqueeze(1)).squeeze(1)
         return -selected if targeted else selected
     raise ValueError("loss_name must be ce or logit")
+
+
+class AveragedModel(nn.Module):
+    def __init__(self, models):
+        super().__init__()
+        models = list(models)
+        if not models:
+            raise ValueError("At least one source model is required")
+        self.models = nn.ModuleList(models)
+
+    def forward(self, inputs):
+        logits = [model(inputs) for model in self.models]
+        return torch.stack(logits, dim=0).mean(dim=0)
 
 
 class PASSScheduler:
@@ -126,6 +170,55 @@ class PASSScheduler:
                     delta_base[triggered] = self.best_delta[triggered]
                 self.stagnation_count[triggered] = 0
             self.last_checkpoint_loss = self.best_loss.clone()
+        return delta_base, self.step_size
+
+
+class APGDScheduler:
+    def __init__(
+        self,
+        steps,
+        batch_size,
+        shape,
+        initial_step_size,
+        device,
+        rho=APGD_RHO,
+        step_decay=APGD_STEP_DECAY,
+        rollback=True,
+    ):
+        self.checkpoints = apgd_checkpoints(steps)
+        self.rho = float(rho)
+        self.step_decay = float(step_decay)
+        self.rollback = bool(rollback)
+        self.step_size = torch.full((batch_size, 1, 1, 1), initial_step_size, device=device)
+        self.best_loss = torch.full((batch_size,), float("inf"), device=device)
+        self.best_delta = torch.zeros(shape, device=device)
+        self.last_best_loss = self.best_loss.clone()
+        self.reduced_last_check = torch.ones(batch_size, dtype=torch.bool, device=device)
+        self.loss_history = []
+
+    @torch.no_grad()
+    def step(self, iteration, delta, eval_delta, loss):
+        delta_base = delta
+        improved = loss < self.best_loss
+        self.best_loss = torch.where(improved, loss, self.best_loss)
+        if improved.any():
+            self.best_delta[improved] = eval_delta[improved]
+        self.loss_history.append(loss)
+        if iteration in self.checkpoints:
+            interval = self.checkpoints[iteration]
+            window = torch.stack(self.loss_history[-interval:], dim=0)
+            comparisons = max(window.shape[0] - 1, 1)
+            improving = (window[1:] < window[:-1]).sum(dim=0)
+            oscillating = improving <= comparisons * self.rho
+            no_improvement = (~self.reduced_last_check) & (self.last_best_loss <= self.best_loss)
+            triggered = oscillating | no_improvement
+            if triggered.any():
+                self.step_size[triggered] *= self.step_decay
+                if self.rollback:
+                    delta_base = delta.clone()
+                    delta_base[triggered] = self.best_delta[triggered]
+            self.last_best_loss = self.best_loss.clone()
+            self.reduced_last_check = triggered.clone()
         return delta_base, self.step_size
 
 
@@ -256,16 +349,11 @@ class TransferAttack:
         similarity = torch.stack(similarities, dim=0).mean(dim=0)
         return loss - self.feature_weight * similarity
 
-    def perturb(self, images, labels):
-        device = images.device
-        batch_size = images.shape[0]
-        delta = torch.zeros_like(images)
-        momentum = torch.zeros_like(images)
-        step_size = torch.full((batch_size, 1, 1, 1), self.initial_step_size, device=device)
-        scheduler = (
-            PASSScheduler(
+    def _build_scheduler(self, batch_size, shape, device):
+        if self.spec.use_pass:
+            return PASSScheduler(
                 batch_size=batch_size,
-                shape=images.shape,
+                shape=shape,
                 initial_step_size=self.initial_step_size,
                 device=device,
                 record_checkpoints=self.record_checkpoints,
@@ -275,9 +363,24 @@ class TransferAttack:
                 stagnation_checks=self.stagnation_checks,
                 rollback=self.rollback,
             )
-            if self.spec.use_pass
-            else None
-        )
+        if self.spec.use_apgd:
+            return APGDScheduler(
+                steps=self.steps,
+                batch_size=batch_size,
+                shape=shape,
+                initial_step_size=self.initial_step_size,
+                device=device,
+                rollback=self.rollback,
+            )
+        return None
+
+    def perturb(self, images, labels):
+        device = images.device
+        batch_size = images.shape[0]
+        delta = torch.zeros_like(images)
+        momentum = torch.zeros_like(images)
+        step_size = torch.full((batch_size, 1, 1, 1), self.initial_step_size, device=device)
+        scheduler = self._build_scheduler(batch_size, images.shape, device)
         kernel = self.kernel.to(device)
         padding = kernel.shape[-1] // 2
 
@@ -320,6 +423,39 @@ class TransferAttack:
             hook.remove()
 
 
+class AutoAttackAPGD:
+    def __init__(self, models, loss_name, targeted, steps=STEPS, epsilon=EPSILON):
+        if targeted:
+            raise ValueError("APGD comparison is evaluated under untargeted mode")
+        if str(loss_name).lower() != "ce":
+            raise ValueError("APGD comparison is evaluated under CE loss")
+        if int(steps) < 1 or float(epsilon) <= 0.0:
+            raise ValueError("steps and epsilon must be positive")
+        try:
+            from autoattack.autopgd_base import APGDAttack
+        except ImportError as error:
+            raise RuntimeError("autoattack is required for standalone APGD") from error
+        self.model = AveragedModel(list(models))
+        device = next(self.model.parameters()).device
+        self.attack = APGDAttack(
+            self.model,
+            norm="Linf",
+            eps=float(epsilon),
+            n_iter=int(steps),
+            n_restarts=1,
+            loss="ce",
+            rho=APGD_RHO,
+            verbose=False,
+            device=device,
+        )
+
+    def perturb(self, images, labels):
+        return self.attack.perturb(images, labels, best_loss=True)
+
+    def close(self):
+        return None
+
+
 def build_attack(
     models,
     feature_layers,
@@ -334,6 +470,8 @@ def build_attack(
     checkpoint_schedule="c2",
     rollback=True,
 ):
+    if str(attack_name).lower() == "apgd":
+        return AutoAttackAPGD(models, loss_name, targeted, steps, epsilon)
     return TransferAttack(
         models=models,
         feature_layers=feature_layers,

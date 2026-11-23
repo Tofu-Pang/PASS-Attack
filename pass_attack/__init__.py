@@ -1,7 +1,12 @@
 from .attack import (
     ADAPTIVE_SCHEDULES,
+    APGD_RHO,
+    APGD_STEP_DECAY,
+    APGDScheduler,
     ATTACK_NAMES,
     ATTACK_SPECS,
+    AutoAttackAPGD,
+    AveragedModel,
     CHECKPOINT_SCHEDULES,
     CHECKPOINTS,
     EPSILON,
@@ -13,6 +18,7 @@ from .attack import (
     STEPS,
     TAU,
     TransferAttack,
+    apgd_checkpoints,
     build_attack,
     resolve_checkpoints,
 )
@@ -27,8 +33,13 @@ from .models import (
 
 __all__ = [
     "ADAPTIVE_SCHEDULES",
+    "APGD_RHO",
+    "APGD_STEP_DECAY",
+    "APGDScheduler",
     "ATTACK_NAMES",
     "ATTACK_SPECS",
+    "AutoAttackAPGD",
+    "AveragedModel",
     "CHECKPOINT_SCHEDULES",
     "CHECKPOINTS",
     "DIVERSE_MODELS",
@@ -44,6 +55,7 @@ __all__ = [
     "STEPS",
     "TAU",
     "TransferAttack",
+    "apgd_checkpoints",
     "build_attack",
     "build_model",
     "resolve_checkpoints",
