@@ -6,6 +6,8 @@ import torch
 from tqdm import tqdm
 
 from pass_attack import (
+    APGD_RHO,
+    APGD_STEP_DECAY,
     ATTACK_NAMES,
     ATTACK_SPECS,
     CHECKPOINT_SCHEDULES,
@@ -17,6 +19,7 @@ from pass_attack import (
     NIPSDataset,
     STEPS,
     TAU,
+    apgd_checkpoints,
     build_attack,
     build_model,
     resolve_checkpoints,
@@ -121,7 +124,8 @@ def execute(args):
         raise ValueError("batch-size must be positive")
     if args.epsilon <= 0.0 or args.alpha <= 0.0:
         raise ValueError("epsilon and alpha must be positive")
-    if ATTACK_SPECS[args.attack].use_pass:
+    spec = ATTACK_SPECS.get(args.attack)
+    if spec is not None and spec.use_pass:
         if not 0.0 <= args.tau < float("inf"):
             raise ValueError("tau must be finite and nonnegative")
         if not 0.0 < args.eta < 1.0:
@@ -142,7 +146,7 @@ def execute(args):
     )
     source_models = [build_model(name, device) for name in source_names]
     target_models = [build_model(name, device) for name in target_names]
-    use_su = ATTACK_SPECS[args.attack].use_su
+    use_su = spec is not None and spec.use_su
     feature_layers = (
         [
             resolve_feature_layer(model, name, FEATURE_LAYER_DEPTH)
@@ -168,7 +172,7 @@ def execute(args):
     )
     successes = torch.zeros(len(target_models), dtype=torch.int64)
     total = 0
-    label = ATTACK_SPECS[args.attack].name
+    label = spec.name if spec is not None else args.attack.upper()
     try:
         for images, true_labels, target_labels in tqdm(loader, desc=label, unit="batch"):
             images = images.to(device, non_blocking=True)
@@ -195,7 +199,7 @@ def execute(args):
             for index, name in enumerate(target_names)
         },
     }
-    if ATTACK_SPECS[args.attack].use_pass:
+    if spec is not None and spec.use_pass:
         record_cps, adaptive_cps = resolve_checkpoints(args.checkpoint_schedule, args.steps)
         result["pass"] = {
             "checkpoint_schedule": args.checkpoint_schedule,
@@ -204,6 +208,13 @@ def execute(args):
             "rollback": not args.no_rollback,
             "eta": args.eta,
             "tau": args.tau,
+        }
+    elif spec is not None and spec.use_apgd:
+        result["apgd"] = {
+            "checkpoints": sorted(apgd_checkpoints(args.steps)),
+            "rho": APGD_RHO,
+            "step_decay": APGD_STEP_DECAY,
+            "rollback": not args.no_rollback,
         }
     return result
 

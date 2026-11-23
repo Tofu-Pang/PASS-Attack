@@ -31,7 +31,9 @@
     "dtni",
     "dtni-pass",
     "dtni-su",
-    "dtni-su-pass"
+    "dtni-su-pass",
+    "dtni-su-apgd",
+    "apgd"
   ],
   "default": {
     "source_models": [

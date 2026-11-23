@@ -5,9 +5,9 @@ Core algorithm implementation of **PASS** (Progress-aware Adaptive Step-size Str
 ## Repository Structure
 
 ```text
-PASS_Code/
+PASS-Attack/
 |-- pass_attack/
-|   |-- attack.py      # Core PASS scheduler (PASSScheduler) and transfer attack backbones
+|   |-- attack.py      # Core PASS scheduler, APGD-style scheduler, and transfer attack backbones
 |   |-- models.py      # Standard and diverse ImageNet model wrappers and feature hooks
 |   `-- data.py        # NIPS 2017 ImageNet-compatible dataset loader
 |-- run_attack.py      # Minimal CLI entry point for running an attack
@@ -22,6 +22,8 @@ Python 3.10 or later and a CUDA-capable GPU are recommended. Install a PyTorch b
 ```bash
 pip install -r requirements.txt
 ```
+
+Standalone `--attack apgd` additionally uses the official `autoattack` package (`pip install git+https://github.com/fra31/auto-attack.git`). `dtni-su-apgd` and all PASS attacks require no extra packages.
 
 Pretrained model weights are downloaded automatically by `torchvision` and `timm` at runtime and are not included in this repository.
 
@@ -62,6 +64,13 @@ Ensemble-source attack:
 
 ```bash
 python run_attack.py --source-models resnet50 densenet121 vgg16 --target-models inception_v3 --attack dtni-su-pass --mode targeted --loss logit
+```
+
+APGD-style comparison (`DTNI-SU-APGD` and standalone `APGD`, untargeted, CE):
+
+```bash
+python run_attack.py --attack dtni-su-apgd --mode untargeted --loss ce
+python run_attack.py --attack apgd --mode untargeted --loss ce
 ```
 
 Checkpoint schedule and rollback options (`c1`, `c2`, `c3`, and `--no-rollback`):
