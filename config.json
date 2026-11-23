@@ -1,0 +1,46 @@
+{
+  "model_groups": {
+    "standard": [
+      "resnet50",
+      "densenet121",
+      "vgg16",
+      "inception_v3"
+    ],
+    "diverse": [
+      "inception_v4",
+      "inception_resnet_v2",
+      "xception",
+      "vit_base_patch16_224"
+    ]
+  },
+  "model_labels": {
+    "resnet50": "ResNet-50",
+    "densenet121": "DenseNet-121",
+    "vgg16": "VGG-16",
+    "inception_v3": "Inception-v3",
+    "inception_v4": "Inception-v4",
+    "inception_resnet_v2": "Inception-ResNet-v2",
+    "xception": "Xception",
+    "vit_base_patch16_224": "ViT-B/16"
+  },
+  "attacks": [
+    "dtmi",
+    "dtmi-pass",
+    "dtmi-su",
+    "dtmi-su-pass",
+    "dtni",
+    "dtni-pass",
+    "dtni-su",
+    "dtni-su-pass"
+  ],
+  "default": {
+    "source_models": [
+      "resnet50"
+    ],
+    "target_models": [
+      "densenet121",
+      "vgg16",
+      "inception_v3"
+    ]
+  }
+}
